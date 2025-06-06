@@ -2,7 +2,7 @@
 
 Simple sheet of fabric simulated using mass spring system
 
-thead are used to spread the computation over all accessible nodes.
+threads are used to spread the computation over all accessible nodes.
 
 Use glut in an simple and very old manner
 
