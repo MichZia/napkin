@@ -163,6 +163,7 @@ void build_norm() {
     for (auto j : range(sz)) {
       auto n = napkin[i][j].normal;
       n *= -1.0f / n.len();
+      napkin[i][j].normal = n;
     }
 }
 
