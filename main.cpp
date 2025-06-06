@@ -1,4 +1,5 @@
 
+#define GL_GLEXT_PROTOTYPES
 #include <GL/glut.h>
 
 #include <GL/glext.h>
@@ -16,6 +17,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <string>
 
 #include "glu_complement.h"
 #include "threadpool.hpp"
@@ -111,6 +113,78 @@ double compute_time = {};
 
 static std::array<std::array<Node, sz>, sz> napkin;
 
+// GPU resources
+GLuint vboPos = 0, vboNorm = 0, vao = 0, shaderProgram = 0;
+GLint uModelView = -1, uProjection = -1, uLightPos = -1, uLightColor = -1;
+size_t vertexCount = 6 * (sz - 1) * (sz - 1);
+static std::vector<V3f> gpuPos;
+static std::vector<V3f> gpuNorm;
+
+static GLuint compileShader(GLenum type, const char* src) {
+  GLuint s = glCreateShader(type);
+  glShaderSource(s, 1, &src, nullptr);
+  glCompileShader(s);
+  GLint ok = 0;
+  glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+  if (!ok) {
+    char log[512];
+    glGetShaderInfoLog(s, sizeof(log), nullptr, log);
+    std::cerr << log << std::endl;
+  }
+  return s;
+}
+
+static GLuint createProgram(const char* vs, const char* fs) {
+  GLuint v = compileShader(GL_VERTEX_SHADER, vs);
+  GLuint f = compileShader(GL_FRAGMENT_SHADER, fs);
+  GLuint p = glCreateProgram();
+  glAttachShader(p, v);
+  glAttachShader(p, f);
+  glBindAttribLocation(p, 0, "position");
+  glBindAttribLocation(p, 1, "normal");
+  glLinkProgram(p);
+  GLint ok = 0;
+  glGetProgramiv(p, GL_LINK_STATUS, &ok);
+  if (!ok) {
+    char log[512];
+    glGetProgramInfoLog(p, sizeof(log), nullptr, log);
+    std::cerr << log << std::endl;
+  }
+  glDeleteShader(v);
+  glDeleteShader(f);
+  return p;
+}
+
+static const char* vsSrc = R"(
+#version 120
+attribute vec3 position;
+attribute vec3 normal;
+uniform mat4 modelViewMatrix;
+uniform mat4 projectionMatrix;
+varying vec3 vNormal;
+varying vec3 vPos;
+void main() {
+  vec4 pos = modelViewMatrix * vec4(position, 1.0);
+  vPos = pos.xyz;
+  vNormal = mat3(modelViewMatrix) * normal;
+  gl_Position = projectionMatrix * pos;
+}
+)";
+
+static const char* fsSrc = R"(
+#version 120
+varying vec3 vNormal;
+varying vec3 vPos;
+uniform vec3 lightPos;
+uniform vec3 lightColor;
+void main() {
+  vec3 N = normalize(vNormal);
+  vec3 L = normalize(lightPos - vPos);
+  float diff = max(dot(N, L), 0.0);
+  gl_FragColor = vec4(lightColor * diff, 1.0);
+}
+)";
+
 float angle = 30;
 
 /* GLUT callback Handlers */
@@ -177,48 +251,73 @@ void build_norm() {
     }
 }
 
+static void updateBuffers() {
+  size_t idx = 0;
+  for (auto i : range(sz - 1)) {
+    for (auto j : range(sz - 1)) {
+      const Node &n00 = napkin[i][j];
+      const Node &n10 = napkin[i + 1][j];
+      const Node &n01 = napkin[i][j + 1];
+      const Node &n11 = napkin[i + 1][j + 1];
+
+      gpuPos[idx] = n00.position;
+      gpuNorm[idx++] = n00.normal;
+      gpuPos[idx] = n10.position;
+      gpuNorm[idx++] = n10.normal;
+      gpuPos[idx] = n01.position;
+      gpuNorm[idx++] = n01.normal;
+
+      gpuPos[idx] = n11.position;
+      gpuNorm[idx++] = n11.normal;
+      gpuPos[idx] = n01.position;
+      gpuNorm[idx++] = n01.normal;
+      gpuPos[idx] = n10.position;
+      gpuNorm[idx++] = n10.normal;
+    }
+  }
+
+  glBindBuffer(GL_ARRAY_BUFFER, vboPos);
+  glBufferSubData(GL_ARRAY_BUFFER, 0, gpuPos.size() * sizeof(V3f),
+                  gpuPos.data());
+  glBindBuffer(GL_ARRAY_BUFFER, vboNorm);
+  glBufferSubData(GL_ARRAY_BUFFER, 0, gpuNorm.size() * sizeof(V3f),
+                  gpuNorm.data());
+}
+
 double draw_time = {};
 
 static void display(void) {
   const auto t = glutGet(GLUT_ELAPSED_TIME);
 
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-  glColor3d(1, 0, 0);
+  build_norm();
+  updateBuffers();
 
-  {
-    // glPolygonMode( GL_FRONT_AND_BACK, GL_LINE );
-    build_norm();
+  glUseProgram(shaderProgram);
+  glPushMatrix();
+  auto &p = napkin[sz / 2][sz / 2].position.p;
+  glTranslatef(-p[0], -p[1], -p[2]);
 
-    glPushMatrix();
-    auto &p = napkin[sz / 2][sz / 2].position.p;
+  GLfloat mv[16];
+  GLfloat pr[16];
+  glGetFloatv(GL_MODELVIEW_MATRIX, mv);
+  glGetFloatv(GL_PROJECTION_MATRIX, pr);
 
-    //        glTranslated(0,1.2,-6);
-    glTranslatef(-p[0], -p[1], -p[2]);
-    //        glScalef(0.5f,0.5f,0.5f);
-    glBegin(GL_TRIANGLES);
+  glUniformMatrix4fv(uModelView, 1, GL_FALSE, mv);
+  glUniformMatrix4fv(uProjection, 1, GL_FALSE, pr);
+  glUniform3fv(uLightPos, 1, light_position);
+  glUniform3fv(uLightColor, 1, light_diffuse);
 
-    auto outNode = [](const Node &n) {
-      glNormal3fv(n.normal.p.data());
-      glVertex3fv(n.position.p.data());
-    };
-    for (auto i : range(sz - 1)) {
-      for (auto j : range(sz - 1)) {
-        outNode(napkin[i + 0][j + 0]);
-        outNode(napkin[i + 1][j + 0]);
-        outNode(napkin[i + 0][j + 1]);
+  glBindVertexArray(vao);
+  glDrawArrays(GL_TRIANGLES, 0, vertexCount);
+  glBindVertexArray(0);
 
-        outNode(napkin[i + 1][j + 1]);
-        outNode(napkin[i + 0][j + 1]);
-        outNode(napkin[i + 1][j + 0]);
-      }
-    }
-    glEnd();
-    glPopMatrix();
+  glPopMatrix();
+  glUseProgram(0);
 
-    //       std::cout<<"draw"<< napkin[sz-1][sz-1].position.p[0] << " " <<
-    //       napkin[sz-1][sz-1].position.p[1] << " " <<
-    //       napkin[sz-1][sz-1].position.p[2] <<std::endl;
-  }
+  //       std::cout<<"draw"<< napkin[sz-1][sz-1].position.p[0] << " " <<
+  //       napkin[sz-1][sz-1].position.p[1] << " " <<
+  //       napkin[sz-1][sz-1].position.p[2] <<std::endl;
 
   glutSwapBuffers();
   const auto t1 = glutGet(GLUT_ELAPSED_TIME);
@@ -440,20 +539,36 @@ int main(int argc, char *argv[]) {
   glEnable(GL_DEPTH_TEST);
   glDepthFunc(GL_LESS);
 
-  glEnable(GL_LIGHT0);
   glEnable(GL_NORMALIZE);
-  glEnable(GL_COLOR_MATERIAL);
-  glEnable(GL_LIGHTING);
 
-  glLightfv(GL_LIGHT0, GL_AMBIENT, light_ambient);
-  glLightfv(GL_LIGHT0, GL_DIFFUSE, light_diffuse);
-  glLightfv(GL_LIGHT0, GL_SPECULAR, light_specular);
-  glLightfv(GL_LIGHT0, GL_POSITION, light_position);
+  gpuPos.resize(vertexCount);
+  gpuNorm.resize(vertexCount);
 
-  glMaterialfv(GL_FRONT, GL_AMBIENT, mat_ambient);
-  glMaterialfv(GL_FRONT, GL_DIFFUSE, mat_diffuse);
-  glMaterialfv(GL_FRONT, GL_SPECULAR, mat_specular);
-  glMaterialfv(GL_FRONT, GL_SHININESS, high_shininess);
+  shaderProgram = createProgram(vsSrc, fsSrc);
+  uModelView = glGetUniformLocation(shaderProgram, "modelViewMatrix");
+  uProjection = glGetUniformLocation(shaderProgram, "projectionMatrix");
+  uLightPos = glGetUniformLocation(shaderProgram, "lightPos");
+  uLightColor = glGetUniformLocation(shaderProgram, "lightColor");
+
+  glGenVertexArrays(1, &vao);
+  glBindVertexArray(vao);
+
+  glGenBuffers(1, &vboPos);
+  glBindBuffer(GL_ARRAY_BUFFER, vboPos);
+  glBufferData(GL_ARRAY_BUFFER, vertexCount * sizeof(V3f), nullptr,
+               GL_DYNAMIC_DRAW);
+  glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(V3f), (void *)0);
+  glEnableVertexAttribArray(0);
+
+  glGenBuffers(1, &vboNorm);
+  glBindBuffer(GL_ARRAY_BUFFER, vboNorm);
+  glBufferData(GL_ARRAY_BUFFER, vertexCount * sizeof(V3f), nullptr,
+               GL_DYNAMIC_DRAW);
+  glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(V3f), (void *)0);
+  glEnableVertexAttribArray(1);
+
+  glBindVertexArray(0);
+
 
   V3f c(0.5, 0.5, 0.0);
   for (auto i : range(sz))
